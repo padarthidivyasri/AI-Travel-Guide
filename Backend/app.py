@@ -1,8 +1,8 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from google import genai
+from google.genai.errors import APIError
 import requests
-import tempfile
 import base64
 import os
 
@@ -45,11 +45,6 @@ Respond ONLY in {language}.
 }
 
 def generate_speech(text, voice_id, locale):
-    temp_audio = tempfile.NamedTemporaryFile(
-        suffix=".mp3",
-        delete=False
-    )
-   
     url = "https://global.api.murf.ai/v1/speech/stream"
     headers = {
         "api-key": os.environ["MURF_API_KEY"],
@@ -65,20 +60,9 @@ def generate_speech(text, voice_id, locale):
     "channelType": "MONO"
     }
 
-    response = requests.post(url, headers=headers, json=data)
-
-    if response.status_code == 200:
-        with open(temp_audio.name, "wb") as f:
-            for chunk in response.iter_content(chunk_size=1024):
-                if chunk:
-                    f.write(chunk)
-                    # Process chunks in real-time if needed
-                    print(f"Received {len(chunk)} bytes")
-        print("Audio streaming completed")
-    else:
-        print(f"Error: {response.status_code}")
-
-    return temp_audio
+    response = requests.post(url, headers=headers, json=data, timeout=60)
+    response.raise_for_status()
+    return response.content
 
 
 def generate_description(place, answer_type, language):
@@ -93,23 +77,59 @@ def generate_description(place, answer_type, language):
 @app.route("/api/generate-audio-guide", methods=["POST"])
 @app.route("/generate-audio-guide", methods=["POST"])
 def generate_audio_guide():
-    data = request.json
-    place = data["place"]
-    answer_type = data["answerType"]
-    language = data["language"]
-    voice_id = data["voiceId"]
-    locale = data["locale"]
+    data = request.get_json(silent=True)
+    required_fields = ("place", "answerType", "language", "voiceId", "locale")
+    if not isinstance(data, dict) or any(
+        not isinstance(data.get(field), str) or not data[field].strip()
+        for field in required_fields
+    ):
+        return jsonify(error="Provide place, answerType, language, voiceId, and locale."), 400
 
+    if data["answerType"] not in PROMPTS:
+        return jsonify(error="answerType must be Summary or Detailed."), 400
 
-    text_description = generate_description(place, answer_type, language)
-    audio_path = generate_speech(text_description, voice_id, locale)
-    audio_bytes = open(audio_path.name, "rb").read()
+    missing_keys = [
+        key for key in ("GOOGLE_API_KEY", "MURF_API_KEY")
+        if not os.environ.get(key)
+    ]
+    if missing_keys:
+        app.logger.error("Missing required environment variables: %s", ", ".join(missing_keys))
+        return jsonify(
+            error=f"Server configuration is missing: {', '.join(missing_keys)}. "
+            "Add them in Vercel Project Settings > Environment Variables."
+        ), 503
+
+    try:
+        text_description = generate_description(
+            data["place"], data["answerType"], data["language"]
+        )
+    except APIError:
+        app.logger.exception("Google Gemini request failed")
+        return jsonify(
+            error="Google Gemini could not generate the guide. Check GOOGLE_API_KEY "
+            "and the model's availability."
+        ), 502
+
+    if not text_description:
+        app.logger.error("Google Gemini returned an empty description")
+        return jsonify(error="Google Gemini returned an empty guide. Please try again."), 502
+
+    try:
+        audio_bytes = generate_speech(
+            text_description, data["voiceId"], data["locale"]
+        )
+    except requests.RequestException:
+        app.logger.exception("Murf speech generation request failed")
+        return jsonify(
+            error="Murf could not generate audio. Check MURF_API_KEY and the selected voice."
+        ), 502
+
+    if not audio_bytes:
+        app.logger.error("Murf returned an empty audio response")
+        return jsonify(error="Murf returned empty audio. Please try again."), 502
+
     encoded_audio = base64.b64encode(audio_bytes).decode("utf-8")
-
-    return {
-        "description": text_description,
-        "audioBase64": encoded_audio
-                }
+    return jsonify(description=text_description, audioBase64=encoded_audio)
 
 if __name__ == "__main__":
     app.run(debug=True)

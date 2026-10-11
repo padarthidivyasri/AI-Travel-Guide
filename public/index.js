@@ -150,7 +150,16 @@ generateButton.addEventListener('click', async () => {
       })
     });
 
-    if (!response.ok) throw new Error('Generation failed');
+    if (!response.ok) {
+      let errorMessage = `Generation failed (${response.status}).`;
+      try {
+        const errorData = await response.json();
+        if (errorData.error) errorMessage = errorData.error;
+      } catch {
+        // Keep the status-based message when the server doesn't return JSON.
+      }
+      throw new Error(errorMessage);
+    }
 
     const data = await response.json();
 
@@ -170,7 +179,7 @@ generateButton.addEventListener('click', async () => {
 
   } catch (err) {
     console.error(err);
-    alert('Generation failed. Please check your connection.');
+    alert(err instanceof Error ? err.message : 'Generation failed. Please try again.');
     generateButton.textContent = 'Generate Audio Guide';
     generateButton.disabled = false;
   }
